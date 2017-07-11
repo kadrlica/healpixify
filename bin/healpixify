@@ -1,0 +1,362 @@
+#!/usr/bin/env python
+"""
+Create healpix coverage map
+"""
+__author__ = "Alex Drlica-Wagner"
+import logging
+import warnings
+import os
+
+import fitsio
+import healpy as hp
+from healpy import fitsfunc
+import numpy as np
+from matplotlib.colors import LogNorm
+import pylab as plt
+import pandas as pd
+
+import astropy.wcs
+import astropy.io.fits as pyfits
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+
+warnings.simplefilter('ignore',category=astropy.wcs.FITSFixedWarning)
+
+def phi2lon(phi): return np.degrees(phi)
+def lon2phi(lon): return np.radians(lon)
+
+def theta2lat(theta): return 90. - np.degrees(theta)
+def lat2theta(lat): return np.radians(90. - lat)
+
+def pix2ang(nside, pix, nest=False):
+    """
+    Return (lon, lat) in degrees instead of (theta, phi) in radians
+    """
+    theta, phi =  hp.pix2ang(nside, pix, nest)
+    lon = phi2lon(phi)
+    lat = theta2lat(theta)
+    return lon, lat
+
+def ang2pix(nside, lon, lat, nest=False):
+    """
+    Input (lon, lat) in degrees instead of (theta, phi) in radians
+    """
+    theta = np.radians(90. - lat)
+    phi = np.radians(lon)
+    return hp.ang2pix(nside, theta, phi, nest)
+
+def ang2vec(lon, lat):
+    """
+    Input (lon, lat) in degrees instead of (theta, phi) in radians
+    """
+    theta = lat2theta(lat)
+    phi = lon2phi(lon)
+    vec = hp.ang2vec(theta, phi)
+    return vec
+
+def ang2disc(nside, lon, lat, radius, inclusive=False, fact=4, nest=False):
+    """
+    Wrap `query_disc` to use lon, lat, and radius in degrees.
+    """
+    vec = ang2vec(lon,lat)
+    return hp.query_disc(nside, vec, np.radians(radius), inclusive, fact, nest)
+
+def write_partial_map(filename,m,nside,nest=False,coord=None,extra_header=()):
+    """Write partial HEALPix map.
+    """
+    if 'PIXEL' not in m.dtype.names:
+        raise Exception("PIXEL column must be specified")
+
+    cols=[]
+
+    for name,fmt in m.dtype.descr:
+        cols.append(pyfits.Column(name=name.upper(),
+                              format='%s' % fitsfunc.getformat(fmt),
+                              array=m[name]
+                              ))
+
+
+    tbhdu = pyfits.BinTableHDU.from_columns(cols)
+    # add needed keywords
+    tbhdu.header['PIXTYPE'] = ('HEALPIX', 'HEALPIX pixelisation')
+    if nest: ordering = 'NESTED'
+    else:    ordering = 'RING'
+    tbhdu.header['ORDERING'] = (ordering,
+                                'Pixel ordering scheme, either RING or NESTED')
+    if coord:
+        tbhdu.header['COORDSYS'] = (coord,
+                                    'Ecliptic, Galactic or Celestial (equatorial)')
+    tbhdu.header['EXTNAME'] = ('xtension',
+                               'name of this binary table extension')
+    tbhdu.header['NSIDE'] = (nside,'Resolution parameter of HEALPIX')
+
+    tbhdu.header['INDXSCHM'] = ('EXPLICIT',
+                                'Indexing: IMPLICIT or EXPLICIT')
+    tbhdu.header['OBJECT'] = ('PARTIAL',
+                              'Sky coverage, either FULLSKY or PARTIAL')
+
+    # FIXME: In modern versions of Pyfits, header.update() understands a
+    # header as an argument, and headers can be concatenated with the `+'
+    # operator.
+    for args in extra_header:
+        tbhdu.header[args[0]] = args[1:]
+
+    fitsfunc.writeto(tbhdu, filename)
+
+def write_map(filename,m,nest=False,dtype=np.float32,fits_IDL=False,coord=None,partial=True,column_names=None,column_units=None,extra_header=()):
+    """Writes an healpix map into an healpix file.
+
+    Parameters
+    ----------
+    filename : str
+      the fits file name
+    m : array or sequence of 3 arrays
+      the map to write. Possibly a sequence of 3 maps of same size.
+      They will be considered as I, Q, U maps.
+      Supports masked maps, see the `ma` function.
+    nest : bool, optional
+      If True, ordering scheme is assumed to be NESTED, otherwise, RING. Default: RING.
+      The map ordering is not modified by this function, the input map array
+      should already be in the desired ordering (run `ud_grade` beforehand).
+    fits_IDL : bool, optional
+      If True, reshapes columns in rows of 1024, otherwise all the data will
+      go in one column. Default: True
+    coord : str
+      The coordinate system, typically 'E' for Ecliptic, 'G' for Galactic or 'C' for
+      Celestial (equatorial)
+    partial : bool, optional
+      If True, fits file is written as a partial-sky file with explicit indexing.
+      Otherwise, implicit indexing is used.  Default: False.
+    column_names : str or list
+      Column name or list of column names, if None we use:
+      I_STOKES for 1 component,
+      I/Q/U_STOKES for 3 components,
+      II, IQ, IU, QQ, QU, UU for 6 components,
+      COLUMN_0, COLUMN_1... otherwise
+    column_units : str or list
+      Units for each column, or same units for all columns.
+    extra_header : list
+      Extra records to add to FITS header.
+    dtype: np.dtype or list of np.dtypes, optional
+      The datatype in which the columns will be stored. Will be converted
+      internally from the numpy datatype to the fits convention. If a list,
+      the length must correspond to the number of map arrays. 
+      Default: np.float32.
+    """
+    if not hasattr(m, '__len__'):
+        raise TypeError('The map must be a sequence')
+
+    m = pixelfunc.ma_to_array(m)
+    if pixelfunc.maptype(m) == 0: # a single map is converted to a list
+        m = [m]
+
+    # check the dtype and convert it
+    try:
+        fitsformat = []
+        for curr_dtype in dtype:
+            fitsformat.append(getformat(curr_dtype))
+    except TypeError:
+        #dtype is not iterable
+        fitsformat = [getformat(dtype)] * len(m)
+
+    if column_names is None:
+        column_names = standard_column_names.get(len(m), ["COLUMN_%d" % n for n in range(len(m))])
+    else:
+        assert len(column_names) == len(m), "Length column_names != number of maps"
+
+    if column_units is None or isinstance(column_units, six.string_types):
+        column_units = [column_units] * len(m)
+
+    # maps must have same length
+    assert len(set(map(len, m))) == 1, "Maps must have same length"
+    nside = pixelfunc.npix2nside(len(m[0]))
+
+    if nside < 0:
+        raise ValueError('Invalid healpix map : wrong number of pixel')
+
+    cols=[]
+    if partial:
+        fits_IDL = False
+        mask = pixelfunc.mask_good(m[0])
+        pix = np.where(mask)[0]
+        if len(pix) == 0:
+            raise ValueError('Invalid healpix map : empty partial map')
+        m = [mm[mask] for mm in m]
+        ff = getformat(np.min_scalar_type(-pix.max()))
+        if ff is None:
+            ff = 'I'
+        cols.append(pf.Column(name='PIXEL',
+                              format=ff,
+                              array=pix,
+                              unit=None))
+
+    for cn, cu, mm, curr_fitsformat in zip(column_names, column_units, m, 
+                                           fitsformat):
+        if len(mm) > 1024 and fits_IDL:
+            # I need an ndarray, for reshape:
+            mm2 = np.asarray(mm)
+            cols.append(pf.Column(name=cn,
+                                   format='1024%s' % curr_fitsformat,
+                                   array=mm2.reshape(mm2.size//1024,1024),
+                                   unit=cu))
+        else:
+            cols.append(pf.Column(name=cn,
+                                   format='%s' % curr_fitsformat,
+                                   array=mm,
+                                   unit=cu))
+
+    tbhdu = pf.BinTableHDU.from_columns(cols)
+    # add needed keywords
+    tbhdu.header['PIXTYPE'] = ('HEALPIX', 'HEALPIX pixelisation')
+    if nest: ordering = 'NESTED'
+    else:    ordering = 'RING'
+    tbhdu.header['ORDERING'] = (ordering,
+                                'Pixel ordering scheme, either RING or NESTED')
+    if coord:
+        tbhdu.header['COORDSYS'] = (coord,
+                                    'Ecliptic, Galactic or Celestial (equatorial)')
+    tbhdu.header['EXTNAME'] = ('xtension',
+                               'name of this binary table extension')
+    tbhdu.header['NSIDE'] = (nside,'Resolution parameter of HEALPIX')
+    if not partial:
+        tbhdu.header['FIRSTPIX'] = (0, 'First pixel # (0 based)')
+        tbhdu.header['LASTPIX'] = (pixelfunc.nside2npix(nside)-1,
+                                   'Last pixel # (0 based)')
+    tbhdu.header['INDXSCHM'] = ('EXPLICIT' if partial else 'IMPLICIT',
+                                'Indexing: IMPLICIT or EXPLICIT')
+    tbhdu.header['OBJECT'] = ('PARTIAL' if partial else 'FULLSKY',
+                              'Sky coverage, either FULLSKY or PARTIAL')
+
+    # FIXME: In modern versions of Pyfits, header.update() understands a
+    # header as an argument, and headers can be concatenated with the `+'
+    # operator.
+    for args in extra_header:
+        tbhdu.header[args[0]] = args[1:]
+
+    writeto(tbhdu, filename)
+
+class Image(object):
+
+    def __init__(self,filename,image_hdu='SCI',mask_hdu='MSK'):
+        self.filename = filename
+        self.image_hdu = image_hdu
+        self.mask_hdu = mask_hdu
+        self._readfile(filename)
+        self._create_wcs()
+
+    @property
+    def corners(self):
+        corners = []
+        for i in range(1,5):
+            corners.append( [self.header['RAC%i'%i],self.header['DECC%d'%i]] )
+        return SkyCoord(np.array(corners),unit=u.deg,frame='icrs')
+
+    @property
+    def center(self):
+        return SkyCoord(self.header['RA_CENT'],self.header['DEC_CENT'],unit=u.deg,frame='icrs')
+
+    def _readfile(self,filename):
+        self.fits = pyfits.open(filename)
+        self.header = self.fits[self.image_hdu].header
+        self.data = self.fits[self.mask_hdu].data
+
+    def _create_wcs(self):
+        self.wcs = astropy.wcs.WCS(self.header)
+
+    def get_radius(self, epsilon=0.0):
+        sep = self.center.separation(self.corners)
+        return np.max(sep.deg)+epsilon
+        
+    def healpixify(self, nside=4096, nest=False):
+        # Determine the radius of the image
+        radius = self.get_radius(epsilon=0.01)
+        center = self.center
+
+        hpx = ang2disc(nside,center.ra.deg,center.dec.deg,radius,nest=nest)
+        ra,dec = pix2ang(nside,hpx,nest=nest)
+
+        xpix,ypix = self.wcs.wcs_world2pix(ra,dec,0)
+        xpix,ypix = np.round([xpix,ypix]).astype(int)
+        shape = self.data.shape
+        sel = (xpix > 0) & (xpix < shape[1]) \
+            & (ypix > 0) & (ypix < shape[0])
+        xpix = xpix[sel]
+        ypix = ypix[sel]
+
+        return hpx[sel], self.data[ypix,xpix]
+
+    def subpixify(self, nside=4096, subnside=4096*2**3, bitmap=2047, nest=True):
+        subpix,subval = self.healpixify(subnside,nest=True)
+        sample = (subnside//nside)**2
+        pix = subpix//sample
+        sel = (subval & bitmap) == 0
+
+        pix = pix[sel]
+        hpx, cts = np.unique(pix,return_counts=True)
+        frac = cts/float(sample)
+        return hpx, frac
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('filenames',nargs='+')
+    parser.add_argument('-m','--mask-hdu', default='MSK',
+                        help='mask hdu name')
+    parser.add_argument('-i','--image-hdu', default='SCI',
+                        help='image hdu name')
+    parser.add_argument('-w','--weight-hdu', default='WGT',
+                        help='weight hdu name')
+    parser.add_argument('-n','--nside',default=4096,type=int,
+                        help='output pixel nside')
+    parser.add_argument('-s','--subnside',default=4096*2**3,type=int,
+                        help='subpixel nside for coverage fraction')
+    parser.add_argument('-b','--mask-bits',default=2047,type=int,
+                        help='masked bits')
+    parser.add_argument('-v','--verbose',action='store_true',
+                        help='output verbosity')
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument('--nest',action='store_true',
+                   help='use nested pixel scheme')
+    g.add_argument('--ring',action='store_true',
+                   help='use ring pixel scheme')
+    args = parser.parse_args()
+
+    logging.basicConfig(format='%(message)s')
+    if args.verbose: logging.getLogger().setLevel(logging.DEBUG)
+
+    for f in args.filenames:
+        logging.info("Loading image: %s"%os.path.basename(f))
+        self = image = Image(f,image_hdu=args.image_hdu,mask_hdu=args.mask_hdu)
+        logging.info("Healpixifying...")
+        hpx,val = image.healpixify(args.nside)
+
+        """
+        plt.figure()
+        x = np.arange(image.data.shape[0])
+        y = np.arange(image.data.shape[-1])
+        plt.pcolormesh(x,y,image.data,norm=LogNorm())
+
+        corners = image.corners        
+        x = np.linspace(corners.ra.deg.min(),corners.ra.deg.max(),200)
+        y = np.linspace(corners.dec.deg.min(),corners.dec.deg.max(),200)
+        xx,yy = np.meshgrid(x,y)
+
+        import pandas as pd
+        p = pd.DataFrame({'hpx':ang2pix(args.nside,xx,yy).flat})
+        m = pd.DataFrame({'hpx':hpx,'val':val})
+        vv = p.merge(m,'left','hpx')['val'].values.reshape(xx.shape)
+
+        plt.figure()
+        plt.pcolormesh(x,y,vv,norm=LogNorm())
+        """
+
+        #m = hp.UNSEEN*np.ones(hp.nside2npix(args.nside))
+        #m[hpx] = val
+        #
+        #corners.ra.wrap_angle = 180*u.deg
+        #hp.cartview(np.log10(m),
+        #            lonra=[np.min(corners.ra.deg),np.max(corners.ra.deg)],
+        #            latra=[np.min(corners.dec.deg),np.max(corners.dec.deg)]
+        #            )
+        
+    logging.info("Done.")
